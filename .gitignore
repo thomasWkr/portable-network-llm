@@ -1,1 +1,11 @@
 *.csv
+__pycache__/
+.venv/
+input_sources/manuals/
+input_sources/other_sources/
+*.part
+
+data/manuals_search.log
+.venv-rag/
+data/
+.runtime/

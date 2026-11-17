@@ -1,52 +1,79 @@
+import re
+
 import pandas as pd
 
-# 1. Carrega o arquivo anterior com os dados já filtrados por fabricante
-df = pd.read_csv('equipamentos_telecom_filtrados.csv', sep=',', low_memory=False)
 
-# 2. Tipos oficiais exatos na Anatel para redes ópticas e roteadores estruturais
-tipos_fibra_rede = [
+INPUT_FILE = 'input_sources/Produtos_Homologados_Anatel.csv'
+OUTPUT_FILE = 'input_sources/onts_onus_olts_roteadores_filtrados.csv'
+VALIDITY_COLUMN = 'Data de Validade do Certificado'
+
+# Estas categorias identificam terminais ópticos, mas não distinguem GPON
+# de outras tecnologias PON. A compatibilidade exige verificar cada modelo.
+OPTICAL_TYPES = {
     'ONT - Terminação de Rede Ótica',
     'ONU - Unidade de Rede Óptica',
-    'Terminal de Linha Óptica',               # OLTs (Central)
-    'Equipamento para Interconexão de Redes', # Roteadores de borda/core
-    'Equipamento de Rede de Dados'            # Roteadores e switches de dados
-]
+    'OLT - Terminação de Linha Óptica',
+    'Terminal de Linha Óptica',
+}
+NETWORK_TYPES = {
+    'Equipamento para Interconexão de Redes',
+    'Equipamento de Rede de Dados',
+    'Transceptor de Radiação Restrita',
+}
+# Limites de palavra evitam que "ont" selecione, por exemplo, "controle".
+# Famílias comerciais não são prova suficiente de que o produto é roteador.
+DEVICE_PATTERN = re.compile(r'\b(?:ont|onu|olt|router|roteador|roteadores)\b', re.I)
 
-# 3. Palavras-chave estritas para resgatar roteadores residenciais que 
-# vêm cadastrados sob a categoria genérica de "Transceptor de Radiação Restrita"
-palavras_chave_roteador = [
-    'router', 'roteador', 'gateway', 'archer', 'echolife', 
-    'optixstar', 'zxhn', 'hg8', 'ont', 'onu', 'h196', 'h1600', 'h3600'
-]
 
-# Prepara colunas auxiliares em minúsculas para busca de texto
-df['Modelo_Lower'] = df['Modelo'].astype(str).str.lower()
-df['Comercial_Lower'] = df['Nome Comercial'].astype(str).str.lower()
+def filter_devices(df):
+    """Seleciona candidatos ópticos/roteadores com validade posterior a 2020.
 
-# Condição A: Pertence aos tipos oficiais de fibra e redes
-filtro_tipo = df['Tipo do Produto'].isin(tipos_fibra_rede)
-
-# Condição B: É transceptor de radiação restrita, mas possui nome/modelo de roteador ou ONT/ONU
-filtro_transceptor_roteador = (
-    (df['Tipo do Produto'] == 'Transceptor de Radiação Restrita') & 
-    (
-        df['Modelo_Lower'].str.contains('|'.join(palavras_chave_roteador), na=False) |
-        df['Comercial_Lower'].str.contains('|'.join(palavras_chave_roteador), na=False)
+    Agrupa por fabricante e modelo, ignorando diferenças de nome comercial,
+    maiúsculas/minúsculas e espaços. Mantém a maior validade de certificado.
+    Registros sem fabricante/modelo só perdem duplicatas de linha inteira.
+    Datas ausentes ou inválidas são excluídas.
+    """
+    descriptions = (
+        df['Modelo'].fillna('') + ' ' + df['Nome Comercial'].fillna('')
     )
-)
+    device_mask = df['Tipo do Produto'].isin(OPTICAL_TYPES) | (
+        df['Tipo do Produto'].isin(NETWORK_TYPES)
+        & descriptions.str.contains(DEVICE_PATTERN, na=False)
+    )
+    validity = pd.to_datetime(df[VALIDITY_COLUMN], errors='coerce')
+    candidates = df.loc[device_mask & validity.dt.year.gt(2020)].drop_duplicates().copy()
+    # Chaves auxiliares ficam fora da saída para preservar as colunas originais.
+    keys = candidates[['Nome do Fabricante', 'Modelo']].apply(
+        lambda column: column.fillna('').str.normalize('NFKC')
+        .str.strip().str.replace(r'\s+', ' ', regex=True).str.casefold()
+    )
+    identified = keys.ne('').all(axis=1)
+    order = pd.DataFrame({
+        'maker': keys['Nome do Fabricante'].to_numpy(),
+        'model': keys['Modelo'].to_numpy(),
+        'validity': pd.to_datetime(candidates[VALIDITY_COLUMN], errors='coerce').to_numpy(),
+        'identified': identified.to_numpy(),
+        'position': range(len(candidates)),
+    })
+    # Em empate, preserva a primeira ocorrência na entrada.
+    keep = order.loc[order['identified']].sort_values(
+        'validity', ascending=False, kind='stable'
+    ).drop_duplicates(['maker', 'model'])['position']
+    positions = sorted([*keep, *order.loc[~order['identified'], 'position']])
+    return candidates.iloc[positions].copy()
 
-# 4. Aplica os filtros combinados
-df_final = df[filtro_tipo | filtro_transceptor_roteador].copy()
 
-# Remove colunas auxiliares e itens duplicados
-df_final = df_final.drop(columns=['Modelo_Lower', 'Comercial_Lower'], errors='ignore')
-df_final = df_final.drop_duplicates()
+def main():
+    # Preserva zeros à esquerda nos números de homologação e CNPJs.
+    df = pd.read_csv(INPUT_FILE, sep=';', dtype=str)
+    result = filter_devices(df)
+    print(f'Total de equipamentos candidatos filtrados: {len(result)}')
+    print('\nDistribuição por Tipo de Produto:')
+    print(result['Tipo do Produto'].value_counts())
+    result.to_csv(OUTPUT_FILE, index=False, encoding='utf-8-sig')
+    print(f'\nArquivo salvo com sucesso como {OUTPUT_FILE!r}!')
+    print('A compatibilidade GPON deve ser confirmada na documentação de cada modelo.')
 
-# Exibe o resumo do resultado
-print(f"Total de equipamentos filtrados: {len(df_final)}")
-print("\nDistribuição por Tipo de Produto:")
-print(df_final['Tipo do Produto'].value_counts())
 
-# 5. Salva o resultado final limpo em um novo arquivo CSV
-df_final.to_csv('onts_onus_olts_roteadores_filtrados.csv', index=False, encoding='utf-8-sig')
-print("\nArquivo salvo com sucesso como 'onts_onus_olts_roteadores_filtrados.csv'!")
+if __name__ == '__main__':
+    main()
