@@ -1,4 +1,5 @@
 """Best-effort whole-device battery estimates; unsupported metrics stay null."""
+import errno
 import os
 import json
 from pathlib import Path
@@ -86,7 +87,16 @@ class Telemetry:
 
     def bridge_battery(self):
         try:
-            reading = json.loads(Path(self.battery_file).read_text(encoding='utf-8'))
+            path = Path(self.battery_file)
+            for attempt in range(3):
+                try:
+                    raw = path.read_text(encoding='utf-8')
+                    break
+                except OSError as exc:
+                    if exc.errno != errno.EIO or attempt == 2:
+                        raise
+                    time.sleep(0.03)
+            reading = json.loads(raw)
             timestamp = float(reading['timestamp'])
             age = time.time() - timestamp
             if not -1 <= age <= self.battery_max_age:

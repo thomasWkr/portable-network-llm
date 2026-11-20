@@ -12,16 +12,47 @@ import time
 import threading
 import tempfile
 import unicodedata
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import parse_qsl, unquote, urljoin, urlsplit
 
 import requests
 
 
 MANUAL = re.compile(r'manual|user.?guide|installation.?guide|guia|instruções|datasheet', re.I)
 LOG = logging.getLogger('manuals')
-VALIDATION_VERSION = '3'
+VALIDATION_VERSION = '4'
 DEFAULT_BACKENDS = 'yahoo,duckduckgo,brave,startpage,mojeek'
 FIELDS = ['Nome do Fabricante', 'Modelo', 'status', 'source_url', 'path', 'sha256', 'detail', 'validation_version']
+OFFICIAL_MANUAL_DOMAINS = frozenset({
+    'alticelabs.com', 'cdatatec.com', 'cdatatec.com.cn', 'chimacn.com', 'datacom.com.br',
+    'digistar.com.br', 'dlink.com', 'dlink.com.br', 'fiberhome.com', 'furukawa.com.br',
+    'hikvision.com', 'hongdian.com', 'intelbras.com', 'kaongroup.com.br', 'lantronix.com',
+    'lightera.com', 'mikrotik.com', 'navigatorlatam.com', 'nokia.com', 'parks.com.br',
+    'parkssolutions.com.br', 'shorelinetelecom.com.br', 'skyworthdigital.com',
+    'szjiuzhou.com.cn', 'tenda.com.cn', 'tianyisc.com', 'tkth.com.br', 'tp-link.com',
+    'ubnt.com', 'vsolcn.com', 'wealbrasil.com', 'x-sirius.com', 'zhone.com',
+    'zpesystems.com', 'zyxel.com',
+})
+
+
+def official_manual_url(url, maker=''):
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ''
+        port = parts.port
+    except ValueError:
+        return False
+    if (parts.scheme != 'https' or parts.username is not None or parts.password is not None
+            or port not in (None, 443)):
+        return False
+    for key, _ in parse_qsl(parts.query):
+        key = key.casefold()
+        if (key in {'token', 'access_token', 'auth', 'signature', 'sig', 'key-pair-id'}
+                or key.startswith(('x-amz-', 'x-goog-'))):
+            return False
+    # Intelbras also hosts FiberHome originals. Require a FiberHome source for those copies.
+    if host == 'backend.intelbras.com' and 'fiberhome' in normalize(maker):
+        return False
+    return any(host == domain or host.endswith('.' + domain) for domain in OFFICIAL_MANUAL_DOMAINS)
 
 
 def normalize(value):
@@ -236,17 +267,28 @@ class Downloader:
         return path.read_bytes(), final_url
 
     def _fetch(self, url):
-        if urlsplit(url).scheme not in ('http', 'https'):
-            raise ValueError('Unsupported URL scheme')
-        LOG.info('FETCH %s', url)
-        with self.session.get(url, timeout=(5, 15), stream=True) as response:
-            response.raise_for_status()
-            data = bytearray()
-            for chunk in response.iter_content(65536):
-                data.extend(chunk)
-                if len(data) > self.max_bytes:
-                    raise ValueError('Response exceeds size limit')
-            return bytes(data), response.url
+        with requests.Session() as public_session:
+            public_session.trust_env = False  # Do not pick up credentials from netrc.
+            public_session.headers['User-Agent'] = self.session.headers['User-Agent']
+            for _ in range(11):
+                if not official_manual_url(url):
+                    raise ValueError('URL is not an approved official HTTPS source')
+                public_session.cookies.clear()
+                LOG.info('FETCH %s', url)
+                with public_session.get(url, timeout=(5, 15), stream=True, allow_redirects=False) as response:
+                    if response.is_redirect:
+                        url = urljoin(url, response.headers['Location'])
+                        continue
+                    response.raise_for_status()
+                    if response.status_code != 200:
+                        raise ValueError(f'Expected public HTTP 200, got {response.status_code}')
+                    data = bytearray()
+                    for chunk in response.iter_content(65536):
+                        data.extend(chunk)
+                        if len(data) > self.max_bytes:
+                            raise ValueError('Response exceeds size limit')
+                    return bytes(data), response.url
+        raise ValueError('Too many redirects')
 
     def search_request(self, query, results):
         if self.provider == 'brave':
@@ -327,6 +369,8 @@ class Downloader:
                     yield url
 
     def save_pdf(self, data, url, maker, model):
+        if not official_manual_url(url, maker):
+            raise ValueError('PDF is not from an approved official HTTPS source')
         if not data.startswith(b'%PDF-'):
             raise ValueError('Response is not a PDF')
         text = self.shared.once(('text', hashlib.sha256(data).hexdigest()), lambda: pdf_text(data))
@@ -351,7 +395,7 @@ class Downloader:
         visited = set()
         try:
             for url in self.search(maker, model, results):
-                if url in visited:
+                if url in visited or not official_manual_url(url, maker):
                     continue
                 visited.add(url)
                 try:
@@ -369,7 +413,7 @@ class Downloader:
                         for tag in page.select('a[href], iframe[src], embed[src], object[data]'):
                             target = urljoin(page_url, tag.get('href') or tag.get('src') or tag.get('data'))
                             label = tag.get_text(' ', strip=True) + ' ' + unquote(target)
-                            if urlsplit(target).scheme in ('http', 'https') and (
+                            if official_manual_url(target, maker) and (
                                     '.pdf' in target.lower() or MANUAL.search(label)
                                     or re.search(r'download|support|document', label, re.I)):
                                 links.append(target)
@@ -401,7 +445,9 @@ class Downloader:
 def cached(row):
     path = Path(row.get('path') or '__missing__')
     if (row.get('validation_version') != VALIDATION_VERSION
-            or row.get('status') != 'downloaded_candidate' or not path.is_file()):
+            or row.get('status') != 'downloaded_candidate'
+            or not official_manual_url(row.get('source_url') or '', row.get('Nome do Fabricante') or '')
+            or not path.is_file()):
         return False
     return hashlib.sha256(path.read_bytes()).hexdigest() == row.get('sha256')
 
@@ -494,17 +540,25 @@ def main(argv=None):
                 LOG.warning('REVALIDATION UNREADABLE %s: %s; searching again', path, exc)
             else:
                 try:
+                    source_url = old.get('source_url') or ''
+                    if not official_manual_url(source_url, maker):
+                        raise ValueError('Previous source is not an approved official HTTPS URL')
                     if not data.startswith(b'%PDF-'):
                         raise ValueError('Response is not a PDF')
                     text = shared.once(('text', hashlib.sha256(data).hexdigest()), lambda: pdf_text(data))
                     evidence = validate_document(text, maker, model, strict=args.strict_validation)
+                    if old.get('validation_version') != VALIDATION_VERSION:
+                        public_data, final_url = local.downloader.fetch(source_url)
+                        if not official_manual_url(final_url, maker) or public_data != data:
+                            raise ValueError('Official public source did not return the same PDF')
+                        source_url = final_url
                 except Exception as exc:
                     LOG.warning('REVALIDATION REJECTED %s / %s: %s; reason=%s', maker, model, path, exc)
                     LOG.info('REVALIDATION PRESERVED %s for review', path)
                 else:
                     LOG.info('REVALIDATION PASSED %s / %s: %s; %s', maker, model, path, evidence)
                     # Reuse the verified local file; no copy or download needed.
-                    return dict(status='downloaded_candidate', source_url=old.get('source_url', ''),
+                    return dict(status='downloaded_candidate', source_url=source_url,
                                 path=str(path.resolve()), sha256=hashlib.sha256(data).hexdigest(),
                                 detail='Revalidation passed: ' + evidence,
                                 validation_version=VALIDATION_VERSION)

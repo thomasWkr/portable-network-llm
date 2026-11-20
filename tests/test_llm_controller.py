@@ -67,6 +67,14 @@ class ControllerTests(unittest.TestCase):
         self.assertIsNone(retriever.infer_model('Comparar HG6145F e F660'))
         self.assertIsNone(retriever.infer_model('O que é GPON?'))
 
+    def test_filter_resolves_comparison_models_and_indexed_olt_alias(self):
+        retriever = llm.Retriever.__new__(llm.Retriever)
+        retriever.models = ['XZ000-G3', 'XZ005-G6', 'DM4618 OLT', 'AB/CD']
+        self.assertEqual(retriever.resolve_target_models('XZ000 G3 / xz005-g6'), ['XZ000-G3', 'XZ005-G6'])
+        self.assertEqual(retriever.resolve_target_models('DM4618'), ['DM4618 OLT'])
+        self.assertEqual(retriever.resolve_target_models('AB / CD'), ['AB/CD'])
+        self.assertEqual(retriever.resolve_target_models('Geral (ONT vs ONU)'), [])
+
     def test_same_page_chunks_share_one_reference(self):
         first = evidence(1, page=2, text='A useful technical description ' + 'overlap ' * 5)
         second = evidence(2, page=2, text='overlap ' * 5 + 'with the next command')
@@ -107,9 +115,42 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(calls, ['First question?'])
             row = json.loads(log.read_text().splitlines()[0])
             self.assertEqual(row['gold']['answer'], 'SECRET_GOLD')
+            other_set = questions.with_name('questions_specific.csv')
+            other_set.write_text(
+                'id,fabricante_alvo,modelo_alvo,question,esperado_completude,resposta_ideal\n'
+                'q1,Intelbras,ONU 110,First question?,Critério,Resposta ideal\n', encoding='utf-8-sig')
+            llm.benchmark(controller, SimpleNamespace(**{**vars(args), 'questions': str(other_set)}))
+            self.assertEqual(calls, ['First question?', 'First question?'])
+            row = json.loads(log.read_text().splitlines()[-1])
+            self.assertEqual(row['question_set'], 'questions_specific')
+            self.assertEqual(row['gold']['modelo_alvo'], 'ONU 110')
+            self.assertEqual(row['gold']['resposta_ideal'], 'Resposta ideal')
             questions.write_text(json.dumps({'id': 'q1', 'question': 'Changed question?'}) + '\n')
             llm.benchmark(controller, args)
             self.assertEqual(calls[-1], 'Changed question?')
+
+    def test_equipment_flag_passes_only_target_model_and_retries_when_it_changes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            questions, log = Path(folder) / 'q.csv', Path(folder) / 'runs.jsonl'
+            header = 'id,question,fabricante_alvo,modelo_alvo,esperado_completude,resposta_ideal\n'
+            questions.write_text(header + '1,Question?,Maker,AX100,Criterion,Answer\n2,General?,,,,\n')
+            calls = []
+
+            def answer(question, **kwargs):
+                calls.append((question, kwargs))
+                return {'status': 'ok', 'experiment_id': 'experiment', 'question': question}
+
+            controller = SimpleNamespace(experiment_id='experiment', run_config={}, answer=answer)
+            args = SimpleNamespace(questions=str(questions), log=str(log), warmup=0, repeats=1,
+                                   seed=42, cooldown=0, include_equipment_model=True)
+            llm.benchmark(controller, args)
+            self.assertCountEqual(calls, [('Question?', {'equipment_model': 'AX100'}), ('General?', {})])
+            llm.benchmark(controller, args)
+            self.assertEqual(len(calls), 2)
+            questions.write_text(questions.read_text().replace('AX100', 'AX200'))
+            llm.benchmark(controller, args)
+            self.assertEqual(calls[-1], ('Question?', {'equipment_model': 'AX200'}))
+            self.assertEqual(len(calls), 3)
 
     def test_battery_energy_is_estimated_only_with_valid_discharging_samples(self):
         sampler = Telemetry()

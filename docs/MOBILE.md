@@ -55,6 +55,13 @@ adb -s PHONE_SERIAL push data/mobile/portable-network-llm.tar.gz /sdcard/Downloa
 
 The default package contains Qwen3.5-0.8B. Use `--llms qwen3.5-0.8b,smollm2-360m` or other prepared presets to include more. `--include-pdfs` includes original documents for later local viewing; without it, citations still display filenames/pages, and the evidence text is in the database. The package excludes the computer's x86 binary, caches, logs, and Python virtual environment. A checksum sidecar describes its files.
 
+Use `--all-llms` to pack every preset in `configs/llms.json`. Prepare the weights first and check available storage on the computer and phone before packaging and extracting.
+
+```bash
+.venv-rag/bin/python mobile_tools.py pack --all-llms \
+  --output data/mobile/portable-network-llm-all.tar.gz
+```
+
 Install [Termux from its supported distribution](https://github.com/termux/termux-app#installation). In Termux, allow shared-storage access when Android asks:
 
 ```bash
@@ -73,22 +80,70 @@ cd /root
 tar -xzf /mnt/download/portable-network-llm.tar.gz
 cd portable-network-llm
 bash scripts/setup_phone_debian.sh
-.venv-rag/bin/python llm_controller.py ask 'Qual é a função da ONU em uma rede GPON?' --run-label s10-lite-proot
+.venv-rag/bin/python llm_controller.py ask 'Qual é a função da ONU em uma rede GPON?' --run-label s20-proot
 ```
 
 Use `--run-label s20-proot` on the other phone. Initial setup needs internet for Debian packages, Python dependencies and pinned llama.cpp source. After setup, model, encoder and index are local: questions do not require internet or the computer. Do not rebuild the index on the phone; use the packaged frozen index. Compile the runtime on each phone rather than reusing binaries built for newer ARM instruction sets.
 
 The server is bound to `127.0.0.1`; no public chat service is started. The Python CLI is the prototype interface. No custom Android application or root access is required for this route. Installation and real-device inference remain to be verified on the S10 Lite and S20.
 
-## Reproducible question batches
+## Teste completo no celular
 
-Use JSONL, JSON arrays, or CSV with `id,question` (also accepts `pergunta`). Reference answers and other gold fields may be included: they are logged for later grading and never put in the LLM prompt. `examples/questions.jsonl` contains demonstration questions, not your final 50-question test set.
+Os arquivos `input_sources/questions_broad.csv` e `input_sources/questions_specific.csv` têm 50 perguntas cada. O formato inclui `id`, `fabricante_alvo`, `modelo_alvo`, `question`, `esperado_completude` e `resposta_ideal`. Por padrão, apenas o enunciado entra no prompt. Os demais campos ficam em `gold` no JSONL para avaliação posterior.
+
+1. No computador, confirme que o índice corresponde aos PDFs que serão usados. Se o acervo mudou, reconstrua com `.venv-rag/bin/python rag_pipeline.py build`. Prepare os modelos escolhidos e empacote o mesmo índice e os dois CSVs para cada telefone.
+
+   ```bash
+   .venv-rag/bin/python mobile_tools.py pack --llms qwen3.5-0.8b,smollm2-360m \
+     --output data/mobile/portable-network-llm-full-test.tar.gz
+   adb devices -l
+   adb -s PHONE_SERIAL push data/mobile/portable-network-llm-full-test.tar.gz \
+     /sdcard/Download/portable-network-llm.tar.gz
+   ```
+
+2. No Termux, siga a instalação do Debian acima. Dentro do Debian, extraia o pacote, execute `bash scripts/setup_phone_debian.sh` na raiz do projeto e rode uma pergunta de conferência. Depois da instalação, o experimento pode rodar offline.
+
+   ```bash
+   .venv-rag/bin/python llm_controller.py ask 'O que indica o LED PON piscando na ONU 110 Intelbras?' \
+     --llm qwen3.5-0.8b --run-label s20-proot-smoke
+   ```
+
+3. Ainda no Debian, rode a matriz com RAG e depois a condição sem RAG, mantendo os demais parâmetros iguais. Use `s20-proot` no outro aparelho. Para medir bateria, deixe o coletor da [ponte Termux:API](ENERGY.md) ativo e acrescente `--battery-file /mnt/download/battery.json` a ambas as execuções. Desconecte o cabo durante a medição de energia.
+
+   ```bash
+   PHONE_LABEL=s20-proot
+   .venv-rag/bin/python run_experiment.py --llms qwen3.5-0.8b,smollm2-360m \
+     --run-label "$PHONE_LABEL" --repeats 3 --warmup 1 --model-cooldown 30 \
+     --output "data/runs/${PHONE_LABEL}/rag"
+   .venv-rag/bin/python run_experiment.py --llms qwen3.5-0.8b,smollm2-360m \
+     --run-label "$PHONE_LABEL" --repeats 3 --warmup 1 --model-cooldown 30 \
+     --no-rag --output "data/runs/${PHONE_LABEL}/no-rag"
+   ```
+
+   A matriz totaliza 1.200 respostas medidas por telefone, com 100 perguntas, três repetições, dois modelos e duas condições. Cada conjunto tem uma pasta própria e um JSONL por modelo. Se houver interrupção, repita o comando com os mesmos parâmetros e a mesma pasta. A retomada usa as respostas já concluídas e tenta novamente as que falharam. Consulte `model_status.jsonl` e os arquivos `.console.log` se um lote terminar com erro.
+
+4. Resuma os JSONL de respostas e copie os resultados para o armazenamento compartilhado. O resumo separa aparelho, modelo, condição RAG e conjunto de perguntas.
+
+   ```bash
+   .venv-rag/bin/python summarize_runs.py "data/runs/${PHONE_LABEL}"/{rag,no-rag}/questions_*/*.jsonl \
+     --csv "data/runs/${PHONE_LABEL}/summary.csv"
+   tar -czf "/mnt/download/${PHONE_LABEL}-results.tar.gz" -C data/runs "$PHONE_LABEL"
+   ```
+
+   No computador, recupere o pacote com `adb -s PHONE_SERIAL pull /sdcard/Download/s20-proot-results.tar.gz` ou copie pelo gerenciador de arquivos. Confira 150 respostas concluídas por combinação de modelo, conjunto e condição. Para avaliar a qualidade, confronte as respostas do JSONL com `gold.esperado_completude` e `gold.resposta_ideal`. O resumo só mede execução. A avaliação das respostas e das fontes citadas é manual.
+
+### Lotes personalizados
+
+O runner usa os dois CSVs por padrão. Para selecionar um conjunto ou arquivos próprios, passe `--questions` uma vez por arquivo. CSV, JSON e JSONL com `id` e `question` (ou `pergunta`) continuam disponíveis. Use `examples/questions.jsonl` para uma demonstração rápida.
+
+Use `--include-equipment-model` para incluir `modelo_alvo` explicitamente no prompt, inclusive com `--no-rag`. Use `--filter-rag-by-equipment-model` para priorizar manuais cadastrados com esse modelo no índice. Os dois flags funcionam separadamente e podem ser combinados em `run_experiment.py` ou `llm_controller.py benchmark`.
+
+O filtro procura modelos cadastrados no índice após normalizar pontuação e espaços. Em perguntas de comparação, valores separados por ` / ` são pesquisados individualmente. Quando há um só modelo-alvo com evidência e outro equipamento, como a OLT, é mencionado na pergunta, a busca pode reservar uma vaga para ele se `--top-k` for maior que 1. Se o campo estiver vazio ou nenhum modelo-alvo retornar passagens, o controlador usa a busca padrão. Os parâmetros aparecem no resumo, e o JSONL registra os modelos-alvo encontrados na busca em `metrics.rag_target_model_applied`.
 
 ```bash
-.venv-rag/bin/python llm_controller.py benchmark \
-  --llm qwen3.5-0.8b --questions examples/questions.jsonl \
-  --repeats 3 --warmup 1 --run-label s10-lite-proot \
-  --log data/runs/s10-lite-qwen.jsonl
+.venv-rag/bin/python run_experiment.py --llms qwen3.5-0.8b,smollm2-360m \
+  --run-label s20-proot --include-equipment-model --filter-rag-by-equipment-model \
+  --output data/runs/s20-proot/rag-with-equipment-filter
 ```
 
 The encoder and LLM remain loaded for the batch. Warm-ups are marked and excluded from summaries; questions run independently in a seeded shuffled order. Run again with the same file/settings to resume completed question/repetition pairs. Changed question text, model artifact, index, prompt/controller version, hardware label or settings produces a new result identity. Errors are retried on resume. Full request/answer logs are fsynced after each question.
@@ -98,13 +153,13 @@ For prepared models, sequential orchestration is available:
 ```bash
 .venv-rag/bin/python run_experiment.py \
   --questions examples/questions.jsonl --llms qwen3.5-0.8b,smollm2-360m \
-  --run-label s10-lite-proot --repeats 3 --model-cooldown 30
+  --run-label s20-proot --repeats 3 --model-cooldown 30
 ```
 
 Use your final test file and `--llms all` once all weights are present. Missing models and runtime/load failures are recorded; the runner does not download them or count them as successful comparisons. `--no-rag` supplies a separate baseline. Evidence packing can differ across tokenizers when a context limit is reached: compare logged evidence and use a common smaller `--top-k` or larger feasible context if identical evidence is required.
 
 ```bash
-.venv-rag/bin/python summarize_runs.py data/runs/s10-lite-qwen.jsonl --csv data/runs/summary.csv
+.venv-rag/bin/python summarize_runs.py data/runs/s20-qwen.jsonl --csv data/runs/summary.csv
 ```
 
 Every successful request records question, raw/display answer, evidence, source IDs, prompt, generation settings, model/runtime/index hashes, device metadata and metrics. `status=ok` means the request completed, not that the answer is correct. Accuracy stays empty until you grade the answers. Citation-ID validity is not semantic factuality. Output-cap hits are flagged; do not score a cut-off answer as a complete procedure.

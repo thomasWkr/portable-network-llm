@@ -70,6 +70,9 @@ def read_questions(path):
     return result
 
 
+DEFAULT_QUESTION_FILES = ('input_sources/questions_broad.csv', 'input_sources/questions_specific.csv')
+
+
 class LlamaClient:
     def __init__(self, url='http://127.0.0.1:8080', timeout=600):
         self.url = url.rstrip('/')
@@ -228,7 +231,7 @@ class Retriever:
             raise ValueError('Vector count mismatch')
         self.models = [row[0] for row in self.db.execute('SELECT DISTINCT model FROM equipment')]
 
-    def infer_model(self, question):
+    def mentioned_models(self, question):
         from rag_pipeline import normalized
         text = question.casefold()
         matches = []
@@ -242,20 +245,74 @@ class Retriever:
         # A longer identifier can contain a shorter family identifier.
         matches = [model for model in matches if not any(normalized(model) != normalized(other)
                    and normalized(model) in normalized(other) for other in matches)]
-        distinct = {normalized(model): model for model in matches}
+        return {normalized(model): model for model in matches}
+
+    def infer_model(self, question):
+        distinct = self.mentioned_models(question)
         return next(iter(distinct.values())) if len(distinct) == 1 else None
 
-    def retrieve(self, question, top_k):
-        from rag_pipeline import search_index
+    def resolve_target_models(self, value):
+        from rag_pipeline import normalized
+        indexed = {normalized(model): model for model in self.models}
+        if normalized(value) in indexed:
+            return [indexed[normalized(value)]]
+        result = []
+        for label in re.split(r'\s+/\s+', value):
+            key = normalized(label)
+            matched = indexed.get(key) or indexed.get(key + 'olt')
+            if matched and matched not in result:
+                result.append(matched)
+        return result
+
+    def retrieve(self, question, top_k, target_model=None):
+        from rag_pipeline import normalized, search_index
         started = time.monotonic()
         vector = self.encoder.encode(['query: ' + question])[0]
         embedded = time.monotonic()
         model = self.infer_model(question)
-        passages = search_index(self.db, self.vectors, vector, question, top_k=top_k * 2, model=model)
-        evidence = merge_page_evidence(passages, top_k)
+        evidence = []
+        supporting_model = None
+        model_passages = []
+        for target in self.resolve_target_models(target_model) if target_model else ():
+            passages = search_index(self.db, self.vectors, vector, question, top_k=top_k * 2, model=target)
+            if passages:
+                model_passages.append((target, passages))
+        if len(model_passages) > 1:
+            # Give each comparison model a chance to contribute a page before filling remaining slots.
+            groups = [merge_page_evidence(passages, top_k) for _, passages in model_passages]
+            pages = {}
+            for rank in range(top_k):
+                for group in groups:
+                    if rank < len(group):
+                        item = group[rank]
+                        pages.setdefault((item['document_id'], item['page']), item)
+            evidence = list(pages.values())[:top_k]
+        elif model_passages:
+            target, passages = model_passages[0]
+            if top_k > 1:
+                # Leave one slot for a second device explicitly named in the question.
+                target_documents = {item['document_id'] for item in passages}
+                for key, other in self.mentioned_models(question).items():
+                    if key == normalized(target):
+                        continue
+                    related = search_index(self.db, self.vectors, vector, question, top_k=top_k * 2, model=other)
+                    related = [item for item in related if item['document_id'] not in target_documents]
+                    if related:
+                        primary = merge_page_evidence(passages, top_k - 1)
+                        evidence = primary[:1] + merge_page_evidence(related, 1) + primary[1:]
+                        supporting_model = other
+                        break
+            if not evidence:
+                evidence = merge_page_evidence(passages, top_k)
+        applied_target = ' / '.join(target for target, _ in model_passages) or None
+        if not evidence:
+            passages = search_index(self.db, self.vectors, vector, question, top_k=top_k * 2, model=model)
+            evidence = merge_page_evidence(passages, top_k)
         return evidence, {'query_embedding_ms': (embedded - started) * 1000,
                           'retrieval_ms': (time.monotonic() - started) * 1000,
-                          'inferred_equipment_model': model}
+                          'inferred_equipment_model': model,
+                          'rag_target_model_applied': applied_target,
+                          'rag_supporting_model': supporting_model}
 
     def close(self):
         self.db.close()
@@ -360,23 +417,29 @@ class Controller:
                            'battery_current_unit': args.battery_current_unit, 'battery_max_age': args.battery_max_age, 'prompt_sha256': hashlib.sha256(RULES.encode()).hexdigest(),
                            'controller_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                            'top_k': args.top_k, 'rag': not args.no_rag, 'run_label': args.run_label,
+                           'include_equipment_model': args.include_equipment_model,
+                           'filter_rag_by_equipment_model': args.filter_rag_by_equipment_model,
                            'device': self.device, 'server_props': self.props}
         stable = {key: value for key, value in self.run_config.items() if key not in ('server_props', 'model_artifact')}
         stable['model_sha256'] = server.info['sha256'] if server else self.model_id
         stable['runtime_sha256'] = server.info['runtime_sha256'] if server else self.props.get('build_info')
         self.experiment_id = hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()[:20]
 
-    def answer(self, question):
+    def answer(self, question, equipment_model=None):
         started = time.monotonic()
         with Telemetry(server_pid=self.server.process.pid if self.server else None,
                        adb_serial=self.args.adb_serial, current_unit=self.args.battery_current_unit,
                        battery_file=self.args.battery_file, battery_max_age=self.args.battery_max_age) as telemetry:
             if self.retriever:
-                evidence, metrics = self.retriever.retrieve(question, self.args.top_k)
+                target_model = equipment_model if self.args.filter_rag_by_equipment_model else None
+                evidence, metrics = self.retriever.retrieve(question, self.args.top_k, target_model=target_model)
             else:
                 evidence, metrics = [], {'retrieval_ms': 0, 'query_embedding_ms': 0, 'inferred_equipment_model': None}
             packing_started = time.monotonic()
-            messages, evidence, prompt_tokens = fit_prompt(self.client, question, evidence, self.context,
+            prompt_question = question
+            if equipment_model and self.args.include_equipment_model:
+                prompt_question = f'Modelo do equipamento: {equipment_model}\n\n{question}'
+            messages, evidence, prompt_tokens = fit_prompt(self.client, prompt_question, evidence, self.context,
                                                           self.args.max_tokens, self.args.no_rag)
             metrics['prompt_packing_ms'] = (time.monotonic() - packing_started) * 1000
             response = self.client.generate(messages, self.model_id, self.args.max_tokens, self.args.seed)
@@ -406,39 +469,56 @@ class Controller:
 
 def benchmark(controller, args):
     questions = read_questions(args.questions)
+    question_set = Path(args.questions).stem
     completed = set()
+    failures = 0
+
+    def equipment_input(row):
+        if getattr(args, 'include_equipment_model', False) or getattr(args, 'filter_rag_by_equipment_model', False):
+            model = row['gold'].get('modelo_alvo')
+            if isinstance(model, str) and model.strip():
+                return {'equipment_model': model.strip()}
+        return {}
+
     if Path(args.log).exists():
         for line in Path(args.log).read_text().splitlines():
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if row.get('status') == 'ok' and not row.get('warmup'):
-                completed.add((row.get('experiment_id'), row.get('question_id'), row.get('question_sha256'), row.get('repeat')))
+            if (row.get('status') == 'ok' and not row.get('warmup')
+                    and row.get('question_set') == question_set):
+                completed.add((row.get('experiment_id'), row.get('question_id'), row.get('question_sha256'),
+                               row.get('repeat'), row.get('equipment_model')))
     for number in range(args.warmup):
-        record = controller.answer(questions[0]['question'])
-        record.update(warmup=True, question_id=questions[0]['id'], repeat=number)
+        extra = equipment_input(questions[0])
+        record = controller.answer(questions[0]['question'], **extra)
+        record.update(warmup=True, question_set=question_set, question_id=questions[0]['id'], repeat=number, **extra)
         append_record(args.log, record)
     for repeat in range(args.repeats):
         order = list(questions)
         random.Random(args.seed + repeat).shuffle(order)
         for row in order:
             question_hash = hashlib.sha256(row['question'].encode()).hexdigest()
-            if (controller.experiment_id, row['id'], question_hash, repeat) in completed:
+            extra = equipment_input(row)
+            if (controller.experiment_id, row['id'], question_hash, repeat, extra.get('equipment_model')) in completed:
                 continue
             try:
-                record = controller.answer(row['question'])
+                record = controller.answer(row['question'], **extra)
             except Exception as exc:
+                failures += 1
                 LOG.exception('Question %s failed', row['id'])
                 record = {'timestamp': utc_now(), 'status': 'error', 'error': str(exc),
                           'experiment_id': controller.experiment_id, 'question': row['question'],
                           'config': controller.run_config}
-            # Gold answers are saved for later scoring; never passed to the LLM.
-            record.update(question_id=row['id'], question_sha256=question_hash, repeat=repeat, gold=row['gold'], warmup=False)
+            # Reference answers and grading criteria are used only for scoring.
+            record.update(question_set=question_set, question_id=row['id'], question_sha256=question_hash,
+                          repeat=repeat, gold=row['gold'], warmup=False, **extra)
             append_record(args.log, record)
             print(f'{row["id"]} repeat={repeat}: {record["status"]}', flush=True)
             if args.cooldown:
                 time.sleep(args.cooldown)
+    return failures
 
 
 def main(argv=None):
@@ -469,7 +549,11 @@ def main(argv=None):
     parser.add_argument('--run-label', default='prototype')
     parser.add_argument('--log', default='data/runs/answers.jsonl')
     parser.add_argument('--json', action='store_true')
-    parser.add_argument('--questions', help='Benchmark CSV/JSON/JSONL: id,question (or pergunta)')
+    parser.add_argument('--questions', help='Benchmark CSV/JSON/JSONL with id and question (or pergunta); other fields are grading metadata')
+    parser.add_argument('--include-equipment-model', action='store_true',
+                        help='Include modelo_alvo from the question file in the benchmark prompt')
+    parser.add_argument('--filter-rag-by-equipment-model', action='store_true',
+                        help='Use modelo_alvo from the question file to prioritize matching manuals in RAG')
     parser.add_argument('--repeats', type=int, default=3)
     parser.add_argument('--warmup', type=int, default=1)
     parser.add_argument('--cooldown', type=float, default=0)
@@ -480,6 +564,10 @@ def main(argv=None):
         parser.error('ask requires only the question text')
     if args.command == 'benchmark' and not args.questions:
         parser.error('benchmark requires --questions')
+    if args.include_equipment_model and args.command != 'benchmark':
+        parser.error('--include-equipment-model requires benchmark')
+    if args.filter_rag_by_equipment_model and (args.command != 'benchmark' or args.no_rag):
+        parser.error('--filter-rag-by-equipment-model requires benchmark with RAG enabled')
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     presets = json.loads(Path(args.config).read_text())
     if args.command == 'list-models':
@@ -505,7 +593,8 @@ def main(argv=None):
         controller = Controller(client, retriever, args, server)
         controller.run_config['controller_initialization_ms'] = (time.monotonic() - initialized) * 1000
         if args.command == 'benchmark':
-            benchmark(controller, args)
+            if benchmark(controller, args):
+                raise SystemExit(1)
         elif args.command == 'ask':
             result = controller.answer(args.question)
             append_record(args.log, result)

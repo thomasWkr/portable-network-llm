@@ -1,3 +1,4 @@
+import errno
 import json
 from pathlib import Path
 import tempfile
@@ -14,6 +15,20 @@ def sample(t, battery):
 
 
 class BatteryBridgeTests(unittest.TestCase):
+    def test_bridge_retries_transient_io_errors_and_rejects_persistent_ones(self):
+        telemetry = Telemetry(battery_file='test')
+        payload = {'current': -500000, 'voltage': 4000, 'status': 'DISCHARGING'}
+        fresh = json.dumps({'timestamp': time.time(), 'payload': payload, 'error': None})
+        error = OSError(errno.EIO, 'Input/output error')
+        with patch('mobile_telemetry.time.sleep'), patch(
+                'mobile_telemetry.Path.read_text', side_effect=[error, fresh]) as read:
+            self.assertEqual(telemetry.battery()['current_now'], -500000)
+            self.assertEqual(read.call_count, 2)
+        with patch('mobile_telemetry.time.sleep'), patch(
+                'mobile_telemetry.Path.read_text', side_effect=error) as read:
+            self.assertIn('Input/output error', telemetry.battery()['_error'])
+            self.assertEqual(read.call_count, 3)
+
     def test_empty_sensor_readings_are_not_reported_as_charging(self):
         telemetry = Telemetry()
         telemetry.samples = [sample(0, {}), sample(1, {})]

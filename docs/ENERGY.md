@@ -47,10 +47,11 @@ Keep this running in one native Termux session:
 
 ```bash
 python "$HOME/storage/downloads/termux_battery_bridge.py" \
+  --setup \
   --output "$HOME/storage/downloads/battery.json"
 ```
 
-It writes readings atomically, about once per second, and prints occasional status snapshots. Failed API calls publish an explicit error; stopped collectors produce stale timestamps that the controller rejects.
+With `--setup`, the script installs the `termux-api` command-line package if needed, then checks that Android returns current, voltage, and status. Install the Android companion app separately. Once the check passes, the collector writes readings atomically about once per second.
 
 ## 4. Check access from another session
 
@@ -71,7 +72,7 @@ In Debian, while the native collector remains running:
 
 ```bash
 .venv-rag/bin/python llm_controller.py benchmark \
-  --questions input_sources/questions.csv --llm qwen3.5-0.8b \
+  --questions input_sources/questions_specific.csv --llm qwen3.5-0.8b \
   --repeats 1 --warmup 1 --run-label s20-proot-energy \
   --battery-file /mnt/download/battery.json \
   --log data/runs/s20-qwen-energy.jsonl

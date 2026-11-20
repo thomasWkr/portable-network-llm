@@ -28,18 +28,20 @@ def summarize(paths):
                 continue
             if row.get('warmup') or 'experiment_id' not in row:
                 continue
-            key = (row.get('question_id'), row.get('question_sha256'), row.get('repeat'))
+            key = (row.get('question_id'), row.get('question_sha256'), row.get('repeat'), row.get('equipment_model'))
             if row.get('question_id') is None:
                 key = (str(path), number)
             # Keep the latest attempt for resumed question/repetition pairs.
-            groups[row['experiment_id']][key] = row
+            groups[(row['experiment_id'], row.get('question_set'))][key] = row
     summary = []
-    for experiment_id, records in groups.items():
+    for (experiment_id, question_set), records in groups.items():
         rows = list(records.values())
         good = [row for row in rows if row.get('status') == 'ok']
         config = rows[-1].get('config', {})
-        entry = {'experiment_id': experiment_id, 'model': config.get('model_id'),
+        entry = {'experiment_id': experiment_id, 'question_set': question_set, 'model': config.get('model_id'),
                  'run_label': config.get('run_label'), 'rag': config.get('rag'),
+                 'include_equipment_model': config.get('include_equipment_model', False),
+                 'filter_rag_by_equipment_model': config.get('filter_rag_by_equipment_model', False),
                  'execution_mode': config.get('device', {}).get('execution_mode'),
                  'successful_runs': len(good), 'failed_runs': len(rows) - len(good),
                  'unique_questions': len({row.get('question_id') or row.get('question') for row in rows}),
@@ -81,10 +83,10 @@ def export_answers(paths, output, repeat=None):
                 question, answer = row.get('question'), row.get('answer')
                 if not isinstance(question, str) or not isinstance(answer, str):
                     raise ValueError(f'Missing question/answer text: {path}:{number}')
-                experiment = row.get('experiment_id', '')
+                experiment = (row.get('experiment_id', ''), row.get('question_set'))
                 experiments.setdefault(experiment, len(experiments))
                 if row.get('question_id') is not None:
-                    key = (experiment, str(row['question_id']), question, row.get('repeat'))
+                    key = (experiment, str(row['question_id']), question, row.get('repeat'), row.get('equipment_model'))
                 else:
                     key = (str(path), number)
                 selected[key] = row
@@ -92,7 +94,7 @@ def export_answers(paths, output, repeat=None):
         identifier = row.get('question_id')
         natural_id = tuple((0, int(part)) if part.isdigit() else (1, part.casefold())
                            for part in re.split(r'(\d+)', str(identifier)) if part)
-        return experiments[row.get('experiment_id', '')], natural_id, row.get('repeat') or 0
+        return experiments[(row.get('experiment_id', ''), row.get('question_set'))], natural_id, row.get('repeat') or 0
     rows = sorted(selected.values(), key=order)
     output = Path(output)
     if any(output.resolve() == Path(path).resolve() for path in paths):

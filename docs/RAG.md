@@ -1,6 +1,6 @@
 # Offline document retrieval
 
-This pipeline indexes the user-reviewed PDFs directly. It does not run the downloader's relevance checks, delete documents, or require an approved manifest. Original PDFs remain unchanged. Exact duplicates were removed once, with a record at `data/rag/duplicate_files.json`; the download report points to the retained copies.
+This pipeline indexes the user-reviewed PDFs directly. After a successful build, it deletes byte-identical extra copies and records the retained paths in `data/rag/duplicate_files.json`. Matching download report entries point to the retained copies.
 
 ## Setup and rebuild
 
@@ -20,7 +20,7 @@ Default input collections:
 - `input_sources/manuals/`: equipment documents.
 - `input_sources/other_sources/`: general networking/PON sources.
 
-Both folders are read recursively. All remaining PDFs are included; textless pages are reported, not deleted. If exact duplicate PDFs are added later, building fails explicitly rather than silently overwriting their source records.
+Both folders are read recursively. The build indexes one copy of each byte-identical PDF using SHA-256 and logs removed paths. When copies appear in both folders, the equipment copy supplies the indexed path and collection. The build reports textless pages.
 
 ## Extraction and passage creation
 
@@ -30,7 +30,7 @@ Cleaning normalizes Unicode and removes common repeated margin boilerplate and p
 
 The embedding model is `intfloat/multilingual-e5-small`: 384-dimensional float32 vectors, masked-mean pooling and L2 normalization. Passage inputs use `passage: ` and question inputs use `query: `, following the model's documentation. The document filename supplies a short title context. Inputs exceeding the 512-token model limit fail rather than being silently truncated. The same encoder/tokenizer fingerprint must be used for indexing and searching.
 
-Manufacturer/model associations come from the download report, supplemented by exact filename matches against `input_sources/onts_onus_olts_roteadores_filtrados.csv`. Deleted duplicate filenames are also considered, preserving aliases for manuals covering multiple models. This is technical source metadata, not a new document approval step. Unmatched PDFs remain searchable, but cannot be selected by an equipment filter until their association is supplied.
+Manufacturer/model associations come from the download report, supplemented by exact filename matches against `input_sources/onts_onus_olts_roteadores_filtrados.csv`. Skipped copies and previously deleted duplicate filenames are also considered, preserving aliases for manuals covering multiple models. Unmatched PDFs remain searchable, but cannot be selected by an equipment filter until their association is supplied.
 
 ## Query examples
 
@@ -66,7 +66,7 @@ All generated files are under `data/rag/` and ignored by Git:
 | `extraction_report.json` | Extraction coverage and pages needing inspection |
 | `extracted/` | Reusable page text keyed by PDF SHA-256 |
 | `embedding_cache.sqlite` | Reusable vectors keyed by encoder and passage content |
-| `duplicate_files.json` | One-time deletion record and retained-file mappings |
+| `duplicate_files.json` | Duplicate deletion history and retained-file mappings |
 
 Rerun `build` after interruptions. Extraction and committed vector batches are cached; source changes and changed passage text get new cache keys. Builds use staging files and publish `build_info.json` last. Query checksums reject incomplete or mismatched output. Do not run two builds into the same output folder concurrently. Default embedding batch size is 8; `--threads` is 4 and `--extract-workers` is 4.
 

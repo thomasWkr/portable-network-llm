@@ -78,15 +78,32 @@ class RagTests(unittest.TestCase):
         self.assertNotIn('HG6145F', expression)
         self.assertNotIn('"uma"', expression)
 
-    def test_duplicate_sources_are_rejected_not_silently_overwritten(self):
+    def test_duplicate_sources_are_removed_and_equipment_aliases_survive_rebuild(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             equipment, network = root / 'equipment', root / 'network'
             equipment.mkdir(); network.mkdir()
-            (equipment / 'one.pdf').write_bytes(b'%PDF same')
+            retained = equipment / 'Acme_AX100.pdf'
+            duplicate = equipment / 'Acme_AX200.pdf'
+            retained.write_bytes(b'%PDF same')
+            duplicate.write_bytes(b'%PDF same')
             (network / 'two.pdf').write_bytes(b'%PDF same')
-            with self.assertRaisesRegex(ValueError, 'Duplicate PDFs'):
-                rag.discover([('equipment', equipment), ('network', network)], root / 'absent.csv')
+            report = root / 'report.csv'
+            report.write_text(f'Nome do Fabricante,Modelo,path\nAcme,AX300,{duplicate}\n')
+            catalog = root / 'catalog.csv'
+            catalog.write_text('Nome do Fabricante,Modelo\nAcme,AX100\nAcme,AX200\n')
+            docs = rag.discover([('equipment', equipment), ('network', network)], report)
+            mapping = root / 'duplicate_files.json'
+            rag.add_catalog_associations(docs, catalog, mapping)
+            self.assertEqual([doc['path'] for doc in docs], [str(retained)])
+            self.assertEqual({item['model'] for item in docs[0]['equipment']}, {'AX100', 'AX200', 'AX300'})
+            self.assertEqual(rag.remove_duplicate_files(docs, report, mapping), 2)
+            self.assertFalse(duplicate.exists())
+            self.assertFalse((network / 'two.pdf').exists())
+            docs = rag.discover([('equipment', equipment), ('network', network)], report)
+            rag.add_catalog_associations(docs, catalog, mapping)
+            self.assertEqual({item['model'] for item in docs[0]['equipment']}, {'AX100', 'AX200', 'AX300'})
+            self.assertEqual(rag.remove_duplicate_files(docs, report, mapping), 0)
 
 
 if __name__ == '__main__':

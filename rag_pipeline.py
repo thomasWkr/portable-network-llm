@@ -11,6 +11,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import time
 import unicodedata
 
@@ -107,7 +108,7 @@ def report_equipment(report):
 
 def discover(roots, report):
     associations = report_equipment(report)
-    documents = []
+    documents = {}
     for collection, root in roots:
         root = Path(root)
         if not root.is_dir():
@@ -116,25 +117,39 @@ def discover(roots, report):
             if not path.is_file() or path.suffix.casefold() != '.pdf':
                 continue
             sha = digest_file(path)
-            documents.append({'id': sha[:24], 'sha256': sha, 'path': str(path),
+            equipment = associations.get(str(path.resolve()), [])
+            if sha in documents:
+                document = documents[sha]
+                document['duplicate_paths'][str(path)] = collection
+                for item in equipment:
+                    if item not in document['equipment']:
+                        document['equipment'].append(item)
+                LOG.info('Skipping duplicate PDF %s (using %s)', path, document['path'])
+                continue
+            documents[sha] = {'id': sha[:24], 'sha256': sha, 'path': str(path),
                               'collection': collection, 'title': path.stem,
-                              'equipment': associations.get(str(path.resolve()), [])})
+                              'equipment': list(equipment), 'duplicate_paths': {}}
     if not documents:
         raise ValueError('No PDFs found')
-    if len({item['sha256'] for item in documents}) != len(documents):
-        raise ValueError('Duplicate PDFs detected; sources changed since cleanup')
-    return documents
+    return list(documents.values())
 
 
 def add_catalog_associations(documents, catalog_path, duplicate_path):
-    """Recover equipment aliases from exact downloader filenames, including removed copies."""
+    """Recover equipment aliases from retained, skipped, and previously removed filenames."""
     if not Path(catalog_path).exists():
         return
-    filenames = {Path(doc['path']).name: doc for doc in documents if doc['collection'] == 'equipment'}
-    by_path = {str(Path(doc['path']).resolve()): doc for doc in documents}
+    filenames = {}
+    by_path = {}
+    for doc in documents:
+        for path, collection in [(doc['path'], doc['collection']), *doc.get('duplicate_paths', {}).items()]:
+            by_path[str(Path(path).resolve())] = doc
+            if collection == 'equipment':
+                filenames[Path(path).name] = doc
     if Path(duplicate_path).exists():
+        by_hash = {doc.get('sha256'): doc for doc in documents if doc.get('sha256')}
         for item in json.loads(Path(duplicate_path).read_text()):
-            doc = by_path.get(str(Path(item['kept']).resolve()))
+            digest = item.get('sha256')
+            doc = by_hash.get(digest) if digest else by_path.get(str(Path(item['kept']).resolve()))
             if doc:
                 filenames[Path(item['removed']).name] = doc
     with Path(catalog_path).open(encoding='utf-8-sig', newline='') as handle:
@@ -150,6 +165,57 @@ def add_catalog_associations(documents, catalog_path, duplicate_path):
                     item = {'manufacturer': maker, 'model': model}
                     if item not in doc['equipment']:
                         doc['equipment'].append(item)
+
+
+def remove_duplicate_files(documents, report, duplicate_path):
+    removals = []
+    for doc in documents:
+        kept = Path(doc['path']).resolve()
+        for source in doc['duplicate_paths']:
+            path = Path(source)
+            if path.resolve() == kept or not path.is_file() or digest_file(path) != doc['sha256']:
+                continue
+            removals.append({'removed': source, 'kept': doc['path'], 'sha256': doc['sha256']})
+    if not removals:
+        return 0
+
+    # Save the aliases and redirect download records before unlinking any copies.
+    history = json.loads(duplicate_path.read_text()) if duplicate_path.exists() else []
+    history.extend(item for item in removals if item not in history)
+    write_json(duplicate_path, history)
+    report = Path(report)
+    if report.is_file():
+        redirects = {Path(item['removed']).resolve(): item for item in removals}
+        with report.open(encoding='utf-8-sig', newline='') as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+            fields = reader.fieldnames
+        changed = False
+        for row in rows:
+            item = redirects.get(Path(row['path']).resolve()) if row.get('path') else None
+            if item and row.get('sha256') in (None, '', item['sha256']):
+                row['path'] = str(Path(item['kept']).resolve())
+                changed = True
+        if changed:
+            with tempfile.TemporaryDirectory(dir=report.parent) as folder:
+                temporary = Path(folder) / report.name
+                with temporary.open('w', encoding='utf-8-sig', newline='') as handle:
+                    writer = csv.DictWriter(handle, fieldnames=fields)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                temporary.replace(report)
+
+    removed = 0
+    for item in removals:
+        path, kept = Path(item['removed']), Path(item['kept'])
+        if not path.is_file() or not kept.is_file() or any(
+                digest_file(copy) != item['sha256'] for copy in (path, kept)):
+            LOG.warning('Duplicate changed before removal: %s', path)
+            continue
+        path.unlink()
+        removed += 1
+        LOG.info('Removed duplicate PDF %s (kept %s)', path, kept)
+    return removed
 
 
 def extract(document, cache):
@@ -247,7 +313,8 @@ def build(args):
     output.mkdir(parents=True, exist_ok=True)
     encoder = E5Encoder(args.model_dir, args.threads)
     documents = discover([('equipment', args.equipment), ('network', args.network)], args.report)
-    add_catalog_associations(documents, args.equipment_csv, output / 'duplicate_files.json')
+    duplicate_path = output / 'duplicate_files.json'
+    add_catalog_associations(documents, args.equipment_csv, duplicate_path)
     staging = output / 'index.sqlite.tmp'
     if staging.exists():
         staging.unlink()
@@ -347,6 +414,7 @@ def build(args):
             'embeddings_sha256': digest_file(output / 'embeddings.npy'),
             'elapsed_seconds': round(time.monotonic() - started, 2)}
     write_json(output / 'build_info.json', info)
+    LOG.info('Removed %s duplicate PDFs', remove_duplicate_files(documents, args.report, duplicate_path))
     print(json.dumps(info, ensure_ascii=False, indent=2))
 
 

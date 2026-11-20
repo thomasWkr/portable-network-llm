@@ -13,12 +13,12 @@ class DownloadTests(unittest.TestCase):
     def test_discovery_rejects_html_and_wrong_pdf_then_downloads(self):
         with tempfile.TemporaryDirectory() as folder:
             worker = dm.Downloader(folder, delay=0)
-            worker.search = lambda *args: iter(['https://example.com/support'])
+            worker.search = lambda *args: iter(['https://example.com/manual.pdf', 'https://www.nokia.com/support'])
             page = b'<a href="/wrong.pdf">Manual</a><a href="/right.pdf">Manual</a>'
             responses = {
-                'https://example.com/support': page,
-                'https://example.com/wrong.pdf': b'%PDF-wrong',
-                'https://example.com/right.pdf': b'%PDF-right',
+                'https://www.nokia.com/support': page,
+                'https://www.nokia.com/wrong.pdf': b'%PDF-wrong',
+                'https://www.nokia.com/right.pdf': b'%PDF-right',
             }
             worker.fetch = lambda url: (responses[url], url)
             with patch.object(dm, 'pdf_text', side_effect=['Other model manual', 'Maker AX100 Router User Manual']):
@@ -28,7 +28,31 @@ class DownloadTests(unittest.TestCase):
             Path(row['path']).write_bytes(b'changed')
             self.assertFalse(dm.cached(row))
             with self.assertRaises(ValueError):
-                worker.save_pdf(b'<html>error</html>', 'https://example.com', 'Maker', 'AX100')
+                worker.save_pdf(b'<html>error</html>', 'https://www.nokia.com', 'Maker', 'AX100')
+
+    def test_public_fetch_rejects_unapproved_redirect_before_requesting_it(self):
+        with tempfile.TemporaryDirectory() as folder:
+            worker = dm.Downloader(folder, delay=0)
+            self.addCleanup(worker.shared.close)
+            with patch.object(dm.requests, 'Session') as session:
+                public = session.return_value.__enter__.return_value
+                response = public.get.return_value.__enter__.return_value
+                response.is_redirect = True
+                response.headers = {'Location': 'https://nokia.com.example.org/manual.pdf'}
+                with self.assertRaisesRegex(ValueError, 'approved official HTTPS'):
+                    worker.fetch('https://www.nokia.com/manual.pdf')
+                public.get.assert_called_once_with('https://www.nokia.com/manual.pdf',
+                                                   timeout=(5, 15), stream=True, allow_redirects=False)
+                public.cookies.clear.assert_called_once()
+                self.assertFalse(public.trust_env)
+
+    def test_only_official_https_urls_without_credentials_are_allowed(self):
+        self.assertTrue(dm.official_manual_url('https://static.tp-link.com/manual.pdf'))
+        for url in ('http://www.nokia.com/manual.pdf', 'https://nokia.com.example.org/manual.pdf',
+                    'https://user:pass@nokia.com/manual.pdf', 'https://nokia.com/manual.pdf?token=abc',
+                    'https://fccid.io/manual.pdf'):
+            with self.subTest(url=url):
+                self.assertFalse(dm.official_manual_url(url))
 
     def test_empty_search_continues_to_next_query(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -158,6 +182,7 @@ class DownloadTests(unittest.TestCase):
             path = Path(folder) / 'old.pdf'
             path.write_bytes(b'%PDF-old')
             row = {'status': 'downloaded_candidate', 'path': str(path),
+                   'source_url': 'https://www.nokia.com/manual.pdf',
                    'sha256': dm.hashlib.sha256(path.read_bytes()).hexdigest()}
             self.assertFalse(dm.cached(row))
             row['validation_version'] = dm.VALIDATION_VERSION
@@ -173,6 +198,7 @@ class DownloadTests(unittest.TestCase):
             row = dict.fromkeys(dm.FIELDS, '')
             row.update({'Nome do Fabricante': 'Maker', 'Modelo': 'AX100',
                         'status': 'downloaded_candidate', 'path': str(old),
+                        'source_url': 'https://www.nokia.com/manual.pdf',
                         'sha256': dm.hashlib.sha256(old.read_bytes()).hexdigest()})
             dm.checkpoint(report, [row])
             with patch.object(dm, 'pdf_text', return_value='Maker AX100 Camera User Manual'), \
@@ -196,6 +222,7 @@ class DownloadTests(unittest.TestCase):
             row = dict.fromkeys(dm.FIELDS, '')
             row.update({'Nome do Fabricante': 'Maker', 'Modelo': 'AX100',
                         'status': 'downloaded_candidate', 'path': str(pdf),
+                        'source_url': 'https://www.nokia.com/manual.pdf',
                         'sha256': dm.hashlib.sha256(pdf.read_bytes()).hexdigest(),
                         'validation_version': dm.VALIDATION_VERSION})
             dm.checkpoint(report, [row])
@@ -254,10 +281,10 @@ class DownloadTests(unittest.TestCase):
     def test_discovers_embedded_pdf_through_download_page(self):
         with tempfile.TemporaryDirectory() as folder:
             worker = dm.Downloader(folder, delay=0)
-            worker.search = lambda *args: iter(['https://example.com/support'])
-            responses = {'https://example.com/support': b'<a href="/download">Download</a>',
-                         'https://example.com/download': b'<iframe src="/manual.pdf"></iframe>',
-                         'https://example.com/manual.pdf': b'%PDF-test'}
+            worker.search = lambda *args: iter(['https://www.nokia.com/support'])
+            responses = {'https://www.nokia.com/support': b'<a href="/download">Download</a>',
+                         'https://www.nokia.com/download': b'<iframe src="/manual.pdf"></iframe>',
+                         'https://www.nokia.com/manual.pdf': b'%PDF-test'}
             worker.fetch = lambda url: (responses[url], url)
             with patch.object(dm, 'pdf_text', return_value='AX100 GPON Ethernet specifications'):
                 self.assertEqual(worker.find('Maker', 'AX100', 6)['status'], 'downloaded_candidate')

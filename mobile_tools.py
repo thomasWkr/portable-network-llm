@@ -16,16 +16,27 @@ RAG_FILES = ['index.sqlite', 'embeddings.npy', 'build_info.json',
 
 
 def pack(args):
+    from llm_controller import DEFAULT_QUESTION_FILES, read_questions
     from rag_pipeline import digest_file
     presets = json.loads(Path(args.config).read_text())
-    selected = args.llms.split(',')
+    selected = list(presets) if args.all_llms or args.llms == 'all' else args.llms.split(',')
+    if not selected:
+        raise ValueError('No model presets configured')
+    unknown = [key for key in selected if key not in presets]
+    if unknown:
+        raise ValueError('Unknown model presets: ' + ', '.join(unknown))
+    missing = [key for key in selected if not (Path(args.model_dir) / presets[key]['filename']).is_file()]
+    if missing:
+        raise ValueError('Missing weights for presets: ' + ', '.join(missing)
+                         + '. Prepare them with prepare_llm_model.py --preset PRESET.')
     files = {name: Path(name) for name in CODE}
+    for name in DEFAULT_QUESTION_FILES:
+        read_questions(name)
+        files[name] = Path(name)
     files['configs/llms.json'] = Path(args.config)
     for name in RAG_FILES:
         files['data/rag/' + name] = Path(args.index) / name
     for key in selected:
-        if key not in presets:
-            raise ValueError('Unknown model preset: ' + key)
         name = presets[key]['filename']
         files['data/llm/' + name] = Path(args.model_dir) / name
     if args.include_pdfs:
@@ -66,7 +77,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
     package = sub.add_parser('pack')
-    package.add_argument('--llms', default='qwen3.5-0.8b', help='Comma-separated prepared presets')
+    models = package.add_mutually_exclusive_group()
+    models.add_argument('--llms', default='qwen3.5-0.8b', help='Comma-separated prepared presets, or all')
+    models.add_argument('--all-llms', action='store_true', help='Pack every preset in the model config')
     package.add_argument('--config', default='configs/llms.json')
     package.add_argument('--index', default='data/rag')
     package.add_argument('--model-dir', default='data/llm')
