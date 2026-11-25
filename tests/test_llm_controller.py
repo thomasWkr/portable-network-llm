@@ -129,6 +129,28 @@ class ControllerTests(unittest.TestCase):
             llm.benchmark(controller, args)
             self.assertEqual(calls[-1], 'Changed question?')
 
+    def test_benchmark_stops_after_managed_server_exits(self):
+        with tempfile.TemporaryDirectory() as folder:
+            questions, log = Path(folder) / 'q.json', Path(folder) / 'runs.jsonl'
+            questions.write_text(json.dumps(['First question?', 'Second question?']))
+            server = llm.ServerProcess.__new__(llm.ServerProcess)
+            server.process = SimpleNamespace(poll=lambda: -9)
+            server.log_path = Path(folder) / 'server.log'
+            calls = []
+
+            def answer(question):
+                calls.append(question)
+                raise RuntimeError('Incomplete LLM stream: no finish reason')
+
+            controller = SimpleNamespace(experiment_id='experiment', run_config={}, answer=answer, server=server)
+            args = SimpleNamespace(questions=str(questions), log=str(log), warmup=0, repeats=1, seed=42, cooldown=0)
+            self.assertEqual(llm.benchmark(controller, args), 1)
+            self.assertEqual(len(calls), 1)
+            row = json.loads(log.read_text())
+            self.assertIn('Incomplete LLM stream', row['error'])
+            self.assertIn('signal 9', row['error'])
+            self.assertIn(str(server.log_path), row['error'])
+
     def test_equipment_flag_passes_only_target_model_and_retries_when_it_changes(self):
         with tempfile.TemporaryDirectory() as folder:
             questions, log = Path(folder) / 'q.csv', Path(folder) / 'runs.jsonl'

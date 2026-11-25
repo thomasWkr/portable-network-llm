@@ -212,6 +212,13 @@ class ServerProcess:
         if self.handle:
             self.handle.close()
 
+    def exit_reason(self):
+        code = self.process.poll()
+        if code is None:
+            return None
+        status = f'signal {-code}' if code < 0 else f'exit code {code}'
+        return f'llama-server stopped ({status}); see {self.log_path}'
+
 
 class Retriever:
     def __init__(self, index, encoder_dir, threads):
@@ -426,6 +433,8 @@ class Controller:
         self.experiment_id = hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()[:20]
 
     def answer(self, question, equipment_model=None):
+        if self.server and (reason := self.server.exit_reason()):
+            raise RuntimeError(reason)
         started = time.monotonic()
         with Telemetry(server_pid=self.server.process.pid if self.server else None,
                        adb_serial=self.args.adb_serial, current_unit=self.args.battery_current_unit,
@@ -472,6 +481,7 @@ def benchmark(controller, args):
     question_set = Path(args.questions).stem
     completed = set()
     failures = 0
+    server = getattr(controller, 'server', None)
 
     def equipment_input(row):
         if getattr(args, 'include_equipment_model', False) or getattr(args, 'filter_rag_by_equipment_model', False):
@@ -503,12 +513,20 @@ def benchmark(controller, args):
             extra = equipment_input(row)
             if (controller.experiment_id, row['id'], question_hash, repeat, extra.get('equipment_model')) in completed:
                 continue
+            server_exit = None
             try:
                 record = controller.answer(row['question'], **extra)
             except Exception as exc:
                 failures += 1
-                LOG.exception('Question %s failed', row['id'])
-                record = {'timestamp': utc_now(), 'status': 'error', 'error': str(exc),
+                server_exit = server.exit_reason() if server else None
+                error = str(exc)
+                if server_exit and server_exit != error:
+                    error = f'{error}. {server_exit}'
+                if server_exit:
+                    LOG.error('Question %s failed: %s', row['id'], error)
+                else:
+                    LOG.exception('Question %s failed', row['id'])
+                record = {'timestamp': utc_now(), 'status': 'error', 'error': error,
                           'experiment_id': controller.experiment_id, 'question': row['question'],
                           'config': controller.run_config}
             # Reference answers and grading criteria are used only for scoring.
@@ -516,6 +534,8 @@ def benchmark(controller, args):
                           repeat=repeat, gold=row['gold'], warmup=False, **extra)
             append_record(args.log, record)
             print(f'{row["id"]} repeat={repeat}: {record["status"]}', flush=True)
+            if server_exit:
+                return failures
             if args.cooldown:
                 time.sleep(args.cooldown)
     return failures
